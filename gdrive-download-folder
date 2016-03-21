@@ -1,0 +1,153 @@
+#!/usr/local/bin/bash
+
+function translate_name {
+    if [ -z "$1" ]; then
+        echo "translate_name called with no ID"
+        exit 0
+    fi
+    echo "$1" | sed -E -e 's/\//\-/g' -e 's/\:/\_/g' -e 's/\&/\_/g'
+}
+
+function download_contents_recursive {
+    if [ -z "$1" ]; then
+        echo "download_contents_recursive called with no ID"
+        exit 0
+    fi
+
+    echo "Examining $1"
+    gdrive_list="$(gdrive list --max 0 --no-header --bytes --name-width 0 --query "trashed = false and '$1' in parents")"
+
+    if [ -z "$gdrive_list" ]; then
+        tput setaf 2
+        echo "$1 is an empty folder. Skipping."
+        tput setaf 7
+        exit 1
+    fi
+
+    while read -r line; do
+        id="$(echo "$line" | cut -d ' ' -f1)"
+        tput setaf 2
+        echo "id = $id in pwd = $(pwd)"
+        tput setaf 7
+
+        # Error handling in bash is limited. Expect > 1 line response from gdrive info; if not, keep retrying
+        gdrive_info=""
+        while [ "$(echo "$gdrive_info" | wc -l | tr -d ' ')" = "1" ]; do
+            if [ "$gdrive_info" != "" ]; then
+                tput setaf 1
+                echo "gdrive info failed! Retrying..."
+                echo "gdrive_info = $gdrive_info"
+                tput setaf 7
+            fi
+
+            echo "Getting info on $id"
+            gdrive_info="$(gdrive info "$id")"
+            name="$(echo "$gdrive_info" | grep '^Name' | sed 's/Name\: //')"
+            path="$(echo "$gdrive_info" | grep '^Path' | sed 's/Path\: //')"
+            mime="$(echo "$gdrive_info" | grep '^Mime' | sed 's/Mime\: //')"
+
+            translated_name="$(translate_name "$name")"
+            echo "Name		= $name"
+            echo "Translated Name	= $translated_name"
+            echo "Path		= $path"
+            echo "Mime		= $mime"
+
+            # Currently gdrive has a bug when the file contains a forward slash (/).
+            # The result is creating an erroneous directory structure (download) or failing to write the file to a nonexistent directory (export).
+            # Accordingly, trap file that contain a forward slash and pause to ask the user to rename them.
+            if [[ "$name" =~ "/" ]]; then
+                tput setaf 1
+                echo "The name <$name> contains a forward slash (/)!"
+                echo "Unfortunately gdrive has a bug and cannot download a file whose name contains a forward slash."
+                echo "You must rename the file in Google Drive now."
+                echo "Press ENTER to continue."
+                tput setaf 7
+                read </dev/tty
+                gdrive_info="" # reset the loop
+            fi
+        done
+
+        if [ "$mime" = "application/vnd.google-apps.folder" ]; then
+            tput setaf 2
+            echo "Detected folder in path <$path>. Creating <$translated_name> and switching in..."
+            tput setaf 7
+            mkdir -p "$translated_name"
+            cd "$translated_name"
+            download_contents_recursive "$id"
+
+            tput setaf 2
+            echo "Done with folder. Switching out..."
+            tput setaf 7
+            cd ..
+        else
+            gdrive_command="gdrive" # Append to this string below
+            case "$mime" in
+                "application/pdf"|"application/vnd.openxmlformats-officedocument.wordprocessingml.document"|"application/vnd.ms-powerpoint"|"image/png"|"text/plain"|"application/rtf"|"application/msword"|"application/octet-stream"|"text/html"|"application/x-javascript"|"text/xml"|"application/vnd.ms-excel"|"image/jpeg"|"image/gif"|"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"|"text/csv" )
+                    echo "Detected native mime type \"$mime\". Downloading..."
+                    gdrive_command="$gdrive_command download --force $id"
+                    ;;
+                "application/vnd.google-apps.spreadsheet" )
+                    echo "Detected Google Sheet. Exporting as openxml..."
+                    gdrive_command="$gdrive_command export --force --mime \"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\" $id"
+                    ;;
+                "application/vnd.google-apps.document" )
+                    echo "Detected Google Document. Exporting as openxml..."
+                    gdrive_command="$gdrive_command export --force --mime \"application/vnd.openxmlformats-officedocument.wordprocessingml.document\" $id"
+                    ;;
+                "application/vnd.google-apps.presentation" )
+                    echo "Detected Google Slides. Exporting as openxml..."
+                    gdrive_command="$gdrive_command export --force --mime \"application/vnd.openxmlformats-officedocument.presentationml.presentation\" $id"
+                    ;;
+                "application/vnd.google-apps.form" )
+                    echo "Detected Google Form. Exporting as zip..."
+                    gdrive_command="$gdrive_command export --force --mime \"application/zip\" $id"
+                    ;;
+                "application/vnd.google-apps.map" )
+                    echo "Detected Google Map. Cannot download or export Google Maps. Skipping..."
+                    continue 1
+                    ;;
+                * )
+                    tput setaf 1
+                    echo "Don't know how to handle this Mime type! Will attempt to download."
+                    gdrive_command="$gdrive_command download --force $id"
+                    echo "gdrive info = $gdrive_info"
+                    gdrive export --print-mimes "$id"
+                    echo "Press ENTER to continue."
+                    tput setaf 7
+                    read </dev/tty
+                    ;;
+            esac
+            # Error handling in bash is limited; Expect response to contain a line beginning with "Downloaed" or "Exported"
+            get_response=""
+            while [ "$(echo "$get_response" | grep -E "^(Downloaded|Exported)" | wc -l | tr -d ' ')" != "1" ]; do
+                if [ "$get_response" != "" ]; then
+                    tput setaf 1
+                    echo "$gdrive_command failed! Retrying..."
+                    tput setaf 7
+                fi
+                echo "Getting file $translated_name"
+                get_response="$(eval "$gdrive_command")"
+                echo "get_response = $get_response"
+            done
+            local_path=""
+            if [[ "$get_response" =~ "Downloaded" ]]; then
+                local_path="$(echo "$get_response" | sed -E -e "s/^.*\-> //" -e "s/^Downloaded.*$//" | tr -d '\n')"
+            fi
+            if [[ "$get_response" =~ "Exported" ]]; then
+                local_path="$(echo "$get_response" | sed -E -e "s/Exported '//" -e "s/' with mime type.*//")"
+            fi
+            translated_path="$(translate_name "$local_path")"
+            echo "Moving local path <$local_path> to translated path <$translated_path>"
+            error_mv="$(mv "$local_path" "$translated_path")"
+            tput setaf 1 && echo "$error_mv" && tput setaf 7
+        fi
+    done <<< "$gdrive_list"
+}
+
+if [ -z "$(which gdrive)" ]; then
+    echo "Fatal: no gdrive command found on this system"
+    exit 0
+else
+    download_contents_recursive "$1"
+    exit 1
+fi
